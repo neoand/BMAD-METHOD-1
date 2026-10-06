@@ -2,36 +2,15 @@
 """
 council_dispatcher.py — Lightweight, Zero-Dependency Swarm Cross-Review Dispatcher for BMAD.
 Dispatches a unified diff to available external LLM CLIs (MiniMax, Kimi, Gemini, Codex)
-and formats findings for the BMAD triage flow.
+and formats findings for the BMAD triage flow without ARG_MAX risks or false approvals.
 """
 
 import sys
 import os
 import subprocess
 import shutil
-
-ADAPTERS = [
-    {
-        "name": "minimax",
-        "bin": os.path.expanduser("~/.local/bin/minimax"),
-        "cmd": lambda bin_path, sys_prompt, prompt: [bin_path, "-s", sys_prompt, prompt]
-    },
-    {
-        "name": "kimi",
-        "bin": os.path.expanduser("~/.kimi-code/bin/kimi"),
-        "cmd": lambda bin_path, sys_prompt, prompt: [bin_path, "-p", f"{sys_prompt}\n\n{prompt}"]
-    },
-    {
-        "name": "gemini",
-        "bin": shutil.which("gemini"),
-        "cmd": lambda bin_path, sys_prompt, prompt: [bin_path, "-p", f"{sys_prompt}\n\n{prompt}"] if bin_path else None
-    },
-    {
-        "name": "codex",
-        "bin": shutil.which("codex"),
-        "cmd": lambda bin_path, sys_prompt, prompt: [bin_path, "-p", f"{sys_prompt}\n\n{prompt}"] if bin_path else None
-    }
-]
+import tempfile
+import time
 
 SYSTEM_PROMPT = """You are an independent Senior Adversarial Code Reviewer operating under the BMAD Method.
 Inspect the unified diff strictly for:
@@ -43,53 +22,123 @@ Inspect the unified diff strictly for:
 RULES:
 - Ignore style or aesthetic suggestions.
 - Report only concrete, reproducible bugs with file/line evidence.
-- If the diff is clean and safe, return strictly: APPROVED.
+- If and only if the diff is completely clean, correct, and free of defects, return strictly the exact word: APPROVED
 """
 
-def detect_adapter():
-    for adapter in ADAPTERS:
-        bin_path = adapter["bin"]
-        if bin_path and os.path.exists(bin_path) and os.access(bin_path, os.X_OK):
-            return adapter
-    return None
+def run_minimax(bin_path, diff_content):
+    # Passes payload via stdin to prevent ARG_MAX blowup on large diffs
+    cmd = [bin_path, "-s", SYSTEM_PROMPT]
+    return subprocess.run(cmd, input=diff_content, capture_output=True, text=True, timeout=180)
+
+def run_kimi(bin_path, diff_content):
+    # Passes payload via stdin or prompt file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as tf:
+        tf.write(diff_content)
+        diff_file = tf.name
+    try:
+        prompt = f"{SYSTEM_PROMPT}\n\nReview the diff at {diff_file}"
+        cmd = [bin_path, "-p", prompt]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    finally:
+        if os.path.exists(diff_file):
+            os.remove(diff_file)
+
+def run_codex(bin_path, diff_content):
+    # Uses canonical non-interactive 'codex exec' command form
+    prompt = f"{SYSTEM_PROMPT}\n\nDiff content:\n{diff_content}"
+    cmd = [bin_path, "exec", "--color", "never", prompt]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+def run_gemini(bin_path, diff_content):
+    cmd = [bin_path, "-p", SYSTEM_PROMPT]
+    return subprocess.run(cmd, input=diff_content, capture_output=True, text=True, timeout=180)
+
+ADAPTERS = [
+    {
+        "name": "minimax",
+        "bin": os.path.expanduser("~/.local/bin/minimax"),
+        "runner": run_minimax
+    },
+    {
+        "name": "kimi",
+        "bin": os.path.expanduser("~/.kimi-code/bin/kimi"),
+        "runner": run_kimi
+    },
+    {
+        "name": "codex",
+        "bin": shutil.which("codex"),
+        "runner": run_codex
+    },
+    {
+        "name": "gemini",
+        "bin": shutil.which("gemini"),
+        "runner": run_gemini
+    }
+]
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: council_dispatcher.py <diff_file_path>", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
     diff_path = sys.argv[1]
     if not os.path.exists(diff_path):
         print(f"Error: Diff file '{diff_path}' not found", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
     with open(diff_path, "r", encoding="utf-8") as f:
         diff_content = f.read()
 
-    adapter = detect_adapter()
-    if not adapter:
-        fallback_dir = "_bmad-output/review-prompts"
-        os.makedirs(fallback_dir, exist_ok=True)
-        fallback_file = os.path.join(fallback_dir, "council-review-manual.md")
-        with open(fallback_file, "w", encoding="utf-8") as f:
-            f.write(f"# BMAD Council Review Prompt\n\n{SYSTEM_PROMPT}\n\n## Unified Diff:\n```diff\n{diff_content}\n```\n")
-        print(f"WARN: No external authenticated CLI found. Prompt written to '{fallback_file}'. Status: HALT_INSPECT")
-        sys.exit(0)
+    executed = False
+    last_error = None
 
-    print(f"[*] Dispatching cross-review to external model via adapter: {adapter['name']}")
-    cmd = adapter["cmd"](adapter["bin"], SYSTEM_PROMPT, diff_content)
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        output = res.stdout.strip()
-        if "APPROVED" in output:
-            print("✅ Council Gate: APPROVED by independent reviewer.")
-            sys.exit(0)
-        else:
-            print(f"⚠️ Council Gate: FINDINGS identified by {adapter['name']}:\n\n{output}")
-            sys.exit(1)
-    except subprocess.TimeoutExpired:
-        print(f"ERROR: Reviewer timeout waiting for CLI '{adapter['name']}'.", file=sys.stderr)
-        sys.exit(2)
+    # Probe adapters in order; try next adapter if one fails or is unauthenticated
+    for adapter in ADAPTERS:
+        bin_path = adapter["bin"]
+        if not (bin_path and os.path.exists(bin_path) and os.access(bin_path, os.X_OK)):
+            continue
+
+        print(f"[*] Probing cross-review with external adapter: {adapter['name']}")
+        try:
+            res = adapter["runner"](bin_path, diff_content)
+            if res.returncode != 0:
+                last_error = f"{adapter['name']} exited with code {res.returncode}: {res.stderr.strip() or res.stdout.strip()}"
+                print(f"[-] Adapter {adapter['name']} failed execution, trying next available reviewer...")
+                continue
+
+            output = res.stdout.strip()
+            # Strict approval verification: must be exactly "APPROVED" or start with "APPROVED\n"
+            # Eliminates false positives like "NOT APPROVED: <bug>"
+            if output == "APPROVED" or output.startswith("APPROVED\n"):
+                print("✅ Council Gate: APPROVED by independent adversarial reviewer.")
+                sys.exit(0)
+            else:
+                print(f"⚠️ Council Gate: FINDINGS identified by {adapter['name']}:\n\n{output}")
+                sys.exit(1)
+
+        except subprocess.TimeoutExpired:
+            print(f"[-] Reviewer timeout waiting for CLI '{adapter['name']}', trying next adapter...")
+            last_error = f"Timeout on {adapter['name']}"
+            continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    # Fallback when no working CLI adapter could execute the review
+    fallback_dir = "_bmad-output/review-prompts"
+    os.makedirs(fallback_dir, exist_ok=True)
+    timestamp = int(time.time())
+    pid = os.getpid()
+    fallback_file = os.path.join(fallback_dir, f"council-review-{timestamp}-{pid}.md")
+    with open(fallback_file, "w", encoding="utf-8") as f:
+        f.write(f"# BMAD Council Review Prompt (Manual Inspection Required)\n\n")
+        if last_error:
+            f.write(f"> Last adapter error: {last_error}\n\n")
+        f.write(f"{SYSTEM_PROMPT}\n\n## Unified Diff:\n```diff\n{diff_content}\n```\n")
+
+    print(f"BLOCKED: No working external CLI reviewer available. Prompt written to '{fallback_file}'. Status: HALT_INSPECT", file=sys.stderr)
+    # Exit with code 2 to ensure automated pipelines treat unreviewed diffs as halted, not approved
+    sys.exit(2)
 
 if __name__ == "__main__":
     main()

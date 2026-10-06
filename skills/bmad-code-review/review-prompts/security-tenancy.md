@@ -50,29 +50,34 @@ Every finding must map to at least one of these concrete threat classes:
 
 ---
 
-## Execution Sequence
+### Step 1: Universal Secrets & Credential Scan
+**MANDATORY FIRST PASS across all modified files:**
+Scan every added line in the diff — regardless of file path, including config files, dotfiles, test files, fixtures, scripts, workflows, and documentation — for:
+- Hardcoded passwords, secrets, private keys, API keys, bearer tokens, or unmasked credentials.
+- Insecure default credentials or credentials committed to sample files that match active patterns.
 
-### Step 1: Scope & Surface Identification
-Identify changed files touching:
-- API routes, RPC handlers, HTTP endpoints.
+### Step 2: Surface Identification & Contextual Threat Walk
+In addition to the universal secrets scan, inspect changed files touching:
+- API routes, RPC handlers, HTTP endpoints, middleware, controllers.
 - Database queries, ORM calls, SQL migrations, repository methods.
 - Authentication, authorization, session management, token parsing.
-- Concurrency primitives (goroutines, async workers, shared caches, mutexes, WebSockets).
-- External input parsing (multipart forms, file uploads, deserialization).
+- Frontend templates and UI rendering (`.vue`, `.html`, `.tsx`, `.jsx`, template literals) for unescaped user content (XSS).
+- Concurrency primitives (goroutines, async workers, shared caches, mutexes, WebSockets, background jobs).
+- External input parsing (multipart forms, file uploads, deserialization, query parameters).
+- Build, CI/CD, and dependency configs for unsafe execution flags or insecure network access.
 
-If the diff touches none of these surfaces (e.g., pure documentation, asset styling, typo fixes), return clean:
-`[]` and stop.
+If the diff contains neither exposed secrets nor changes to the architectural surfaces above (e.g. pure markdown typos, isolated CSS cosmetic padding), return clean: `[]` and stop.
 
-### Step 2: Mechanical Threat Walk
+### Step 3: Mechanical Threat Walk
 For each changed line in scope, walk the 5 Threat Classes:
 1. Is tenancy/organization scoping enforced on every query and mutation?
-2. Are permissions checked before executing domain actions?
-3. Are inputs sanitized and parameterized before reaching execution engines?
-4. Are secrets or PII kept out of plaintext logs and client responses?
-5. Is concurrent access safely locked and payload sizes capped?
+2. Are permissions and roles checked before executing domain actions or accessing resources?
+3. Are inputs sanitized, validated, and parameterized before reaching execution engines (SQL, shell, HTML)?
+4. Are secrets, tokens, or PII kept out of plaintext logs, telemetry, and client responses?
+5. Is concurrent access safely locked, shared contexts cloned, and payload sizes capped?
 
-### Step 3: Filter & Format Findings
-Discard theoretical or already-guarded paths silently. Collect verified gaps.
+### Step 4: Filter & Format Findings
+Discard theoretical, unreachable, or already-guarded paths silently. Collect verified gaps.
 
 ---
 

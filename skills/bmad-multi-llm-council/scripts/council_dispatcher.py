@@ -31,17 +31,22 @@ def run_minimax(bin_path, diff_content):
     return subprocess.run(cmd, input=diff_content, capture_output=True, text=True, timeout=180)
 
 def run_kimi(bin_path, diff_content):
-    # Passes payload via stdin or prompt file
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as tf:
-        tf.write(diff_content)
-        diff_file = tf.name
+    # Passes payload via ephemeral tempfile with 0600 permissions and guaranteed cleanup
+    diff_file = None
     try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".diff", delete=False) as tf:
+            os.chmod(tf.name, 0o600)
+            tf.write(diff_content)
+            diff_file = tf.name
         prompt = f"{SYSTEM_PROMPT}\n\nReview the diff at {diff_file}"
         cmd = [bin_path, "-p", prompt]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     finally:
-        if os.path.exists(diff_file):
-            os.remove(diff_file)
+        if diff_file and os.path.exists(diff_file):
+            try:
+                os.remove(diff_file)
+            except OSError:
+                pass
 
 def run_codex(bin_path, diff_content):
     # Uses canonical non-interactive 'codex exec' command form
@@ -135,6 +140,10 @@ def main():
         if last_error:
             f.write(f"> Last adapter error: {last_error}\n\n")
         f.write(f"{SYSTEM_PROMPT}\n\n## Unified Diff:\n```diff\n{diff_content}\n```\n")
+    try:
+        os.chmod(fallback_file, 0o600)
+    except OSError:
+        pass
 
     print(f"BLOCKED: No working external CLI reviewer available. Prompt written to '{fallback_file}'. Status: HALT_INSPECT", file=sys.stderr)
     # Exit with code 2 to ensure automated pipelines treat unreviewed diffs as halted, not approved
